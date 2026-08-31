@@ -1,11 +1,43 @@
-﻿const mongoose = require('mongoose');
+﻿const mongoose = require("mongoose");
 
-const queueSchema = new mongoose.Schema({
-  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  courseCode: { type: String, required: true },
-  location: { type: String, required: true },
-  status: { type: String, enum: ['waiting', 'served', 'cancelled'], default: 'waiting' },
-  priority: { type: Number, default: 0 },
-}, { timestamps: true });
+const queueSchema = new mongoose.Schema(
+  {
+    name: {
+      type: String,
+      required: true,
+      trim: true,
+    },
 
-module.exports = mongoose.model('Queue', queueSchema);
+    description: {
+      type: String,
+      trim: true,
+    },
+
+    location: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+
+    status: {
+      type: String,
+      enum: ["open", "closed"],
+      default: "open",
+    },
+
+    managedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
+
+    maxCapacity: {
+      type: Number,
+      default: 100,
+      min: 1,
+    },
+  },
+  { timestamps: true }
+);
+
+module.exports = mongoose.model("Queue", queueSchema);
