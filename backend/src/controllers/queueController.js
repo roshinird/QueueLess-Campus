@@ -143,7 +143,7 @@ exports.joinQueue = async (req, res) => {
             });
         }
 
-        // Check queue status
+        // Check if queue is open
         if (queue.status !== "open") {
             return res.status(400).json({
                 message: "This queue is currently closed",
@@ -262,6 +262,16 @@ exports.callNextStudent = async (req, res) => {
     try {
         const queueId = req.params.id;
 
+        // Only staff/admin can call the next student
+        if (
+            req.user.role !== "staff" &&
+            req.user.role !== "admin"
+        ) {
+            return res.status(403).json({
+                message: "Access denied. Staff only.",
+            });
+        }
+
         // Find first waiting token
         const nextToken = await QueueToken.findOne({
             queue: queueId,
@@ -276,7 +286,7 @@ exports.callNextStudent = async (req, res) => {
             });
         }
 
-        // Change status
+        // Change token status to serving
         nextToken.status = "serving";
 
         await nextToken.save();
@@ -284,11 +294,13 @@ exports.callNextStudent = async (req, res) => {
         // Get queue information
         const queue = await Queue.findById(queueId);
 
-        // Create notification for student
+        // Create database notification
         await Notification.create({
             user: nextToken.user,
             title: "Your turn!",
-            message: `Token #${nextToken.tokenNumber} is now being served at ${queue ? queue.name : "the queue"}.`,
+            message: `Token #${nextToken.tokenNumber} is now being served at ${
+                queue ? queue.name : "the queue"
+            }.`,
             type: "info",
             payload: {
                 queueId: queueId,
@@ -296,6 +308,21 @@ exports.callNextStudent = async (req, res) => {
                 tokenNumber: nextToken.tokenNumber,
             },
         });
+
+        // Get Socket.IO instance
+        const io = req.app.get("io");
+
+        // Send real-time event to queue room
+        if (io) {
+            io.to(`queue-${queueId}`).emit("tokenCalled", {
+                queueId: queueId,
+                tokenId: nextToken._id,
+                tokenNumber: nextToken.tokenNumber,
+                status: nextToken.status,
+                userId: nextToken.user,
+                message: `Token #${nextToken.tokenNumber} is now being served.`,
+            });
+        }
 
         res.json({
             message: "Next student called successfully",
@@ -318,6 +345,16 @@ exports.callNextStudent = async (req, res) => {
 exports.serveToken = async (req, res) => {
     try {
         const tokenId = req.params.tokenId;
+
+        // Only staff/admin can serve students
+        if (
+            req.user.role !== "staff" &&
+            req.user.role !== "admin"
+        ) {
+            return res.status(403).json({
+                message: "Access denied. Staff only.",
+            });
+        }
 
         const token = await QueueToken.findById(tokenId);
 
@@ -348,7 +385,7 @@ exports.serveToken = async (req, res) => {
         console.error("Serve token error:", error);
 
         res.status(500).json({
-            message: "Server error while serving token",
+            message: "Server error while serving queue token",
         });
     }
 };
