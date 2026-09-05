@@ -49,6 +49,7 @@ app.get("/", (req, res) => {
 io.on("connection", (socket) => {
     console.log("Socket connected:", socket.id);
 
+    // Join a queue room
     socket.on("joinQueueRoom", (queueId) => {
         socket.join(`queue-${queueId}`);
 
@@ -57,6 +58,16 @@ io.on("connection", (socket) => {
         );
     });
 
+    // Join a user's personal notification room
+    socket.on("joinUserRoom", (userId) => {
+        socket.join(`user-${userId}`);
+
+        console.log(
+            `Socket ${socket.id} joined user room: user-${userId}`
+        );
+    });
+
+    // Leave a queue room
     socket.on("leaveQueueRoom", (queueId) => {
         socket.leave(`queue-${queueId}`);
 
@@ -65,6 +76,7 @@ io.on("connection", (socket) => {
         );
     });
 
+    // Socket disconnected
     socket.on("disconnect", () => {
         console.log("Socket disconnected:", socket.id);
     });

@@ -41,6 +41,7 @@ const queueTokenSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+// Every token number must be unique within a queue.
 queueTokenSchema.index(
   { queue: 1, tokenNumber: 1 },
   { unique: true }

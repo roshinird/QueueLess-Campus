@@ -133,6 +133,7 @@ exports.closeQueue = async (req, res) => {
 exports.joinQueue = async (req, res) => {
     try {
         const queueId = req.params.id;
+        const userId = req.user.id;
 
         // Check if queue exists
         const queue = await Queue.findById(queueId);
@@ -150,25 +151,10 @@ exports.joinQueue = async (req, res) => {
             });
         }
 
-        // Count active tokens
-        const waitingCount = await QueueToken.countDocuments({
-            queue: queueId,
-            status: {
-                $in: ["waiting", "serving"],
-            },
-        });
-
-        // Check capacity
-        if (waitingCount >= queue.maxCapacity) {
-            return res.status(400).json({
-                message: "Queue is currently full",
-            });
-        }
-
         // Check if user already has an active token
         const existingToken = await QueueToken.findOne({
             queue: queueId,
-            user: req.user.id,
+            user: userId,
             status: {
                 $in: ["waiting", "serving"],
             },
@@ -178,6 +164,21 @@ exports.joinQueue = async (req, res) => {
             return res.status(400).json({
                 message: "You are already in this queue",
                 token: existingToken,
+            });
+        }
+
+        // Count active tokens
+        const activeTokenCount = await QueueToken.countDocuments({
+            queue: queueId,
+            status: {
+                $in: ["waiting", "serving"],
+            },
+        });
+
+        // Check capacity
+        if (activeTokenCount >= queue.maxCapacity) {
+            return res.status(400).json({
+                message: "Queue is currently full",
             });
         }
 
@@ -192,18 +193,73 @@ exports.joinQueue = async (req, res) => {
             ? lastToken.tokenNumber + 1
             : 1;
 
-        // Create token
-        const token = await QueueToken.create({
+        let token;
+
+        try {
+            token = await QueueToken.create({
+                queue: queueId,
+                user: userId,
+                tokenNumber: nextTokenNumber,
+                status: "waiting",
+            });
+        } catch (createError) {
+            // MongoDB duplicate-key error.
+            // This can happen when two users join at almost
+            // exactly the same time and both calculate the same
+            // next token number.
+            if (createError.code === 11000) {
+                const latestToken = await QueueToken.findOne({
+                    queue: queueId,
+                }).sort({
+                    tokenNumber: -1,
+                });
+
+                const retryTokenNumber = latestToken
+                    ? latestToken.tokenNumber + 1
+                    : 1;
+
+                token = await QueueToken.create({
+                    queue: queueId,
+                    user: userId,
+                    tokenNumber: retryTokenNumber,
+                    status: "waiting",
+                });
+            } else {
+                throw createError;
+            }
+        }
+
+        // Position is calculated from active tokens with a lower
+        // token number.
+        const peopleAhead = await QueueToken.countDocuments({
             queue: queueId,
-            user: req.user.id,
-            tokenNumber: nextTokenNumber,
-            status: "waiting",
+            status: {
+                $in: ["waiting", "serving"],
+            },
+            tokenNumber: {
+                $lt: token.tokenNumber,
+            },
         });
+
+        // Real-time notification for clients currently watching
+        // this queue.
+        const io = req.app.get("io");
+
+        if (io) {
+            io.to(`queue-${queueId}`).emit("queueUpdated", {
+                queueId,
+                event: "studentJoined",
+                tokenId: token._id,
+                tokenNumber: token.tokenNumber,
+                status: token.status,
+                activeTokenCount: activeTokenCount + 1,
+            });
+        }
 
         res.status(201).json({
             message: "Successfully joined queue",
             token,
-            position: waitingCount + 1,
+            position: peopleAhead + 1,
         });
 
     } catch (error) {
@@ -240,6 +296,18 @@ exports.cancelQueue = async (req, res) => {
 
         await token.save();
 
+        const io = req.app.get("io");
+
+        if (io) {
+            io.to(`queue-${queueId}`).emit("queueUpdated", {
+                queueId,
+                event: "tokenCancelled",
+                tokenId: token._id,
+                tokenNumber: token.tokenNumber,
+                status: token.status,
+            });
+        }
+
         res.json({
             message: "Queue token cancelled successfully",
             token,
@@ -272,6 +340,39 @@ exports.callNextStudent = async (req, res) => {
             });
         }
 
+        // Check queue exists
+        const queue = await Queue.findById(queueId);
+
+        if (!queue) {
+            return res.status(404).json({
+                message: "Queue not found",
+            });
+        }
+
+        // Verify staff owns the queue.
+        // Admins can manage any queue.
+        if (
+            req.user.role !== "admin" &&
+            queue.managedBy.toString() !== req.user.id
+        ) {
+            return res.status(403).json({
+                message: "Not authorized to manage this queue",
+            });
+        }
+
+        // Do not call another student while one is already serving.
+        const currentServingToken = await QueueToken.findOne({
+            queue: queueId,
+            status: "serving",
+        });
+
+        if (currentServingToken) {
+            return res.status(400).json({
+                message: `Token #${currentServingToken.tokenNumber} is currently being served`,
+                token: currentServingToken,
+            });
+        }
+
         // Find first waiting token
         const nextToken = await QueueToken.findOne({
             queue: queueId,
@@ -291,16 +392,11 @@ exports.callNextStudent = async (req, res) => {
 
         await nextToken.save();
 
-        // Get queue information
-        const queue = await Queue.findById(queueId);
-
         // Create database notification
         await Notification.create({
             user: nextToken.user,
             title: "Your turn!",
-            message: `Token #${nextToken.tokenNumber} is now being served at ${
-                queue ? queue.name : "the queue"
-            }.`,
+            message: `Token #${nextToken.tokenNumber} is now being served at ${queue.name}.`,
             type: "info",
             payload: {
                 queueId: queueId,
@@ -312,8 +408,8 @@ exports.callNextStudent = async (req, res) => {
         // Get Socket.IO instance
         const io = req.app.get("io");
 
-        // Send real-time event to queue room
         if (io) {
+            // Notify everyone watching the queue.
             io.to(`queue-${queueId}`).emit("tokenCalled", {
                 queueId: queueId,
                 tokenId: nextToken._id,
@@ -321,6 +417,16 @@ exports.callNextStudent = async (req, res) => {
                 status: nextToken.status,
                 userId: nextToken.user,
                 message: `Token #${nextToken.tokenNumber} is now being served.`,
+            });
+
+            // Notify the specific student's room.
+            io.to(`user-${nextToken.user}`).emit("notification", {
+                title: "Your turn!",
+                message: `Token #${nextToken.tokenNumber} is now being served at ${queue.name}.`,
+                type: "info",
+                queueId,
+                tokenId: nextToken._id,
+                tokenNumber: nextToken.tokenNumber,
             });
         }
 
@@ -344,6 +450,7 @@ exports.callNextStudent = async (req, res) => {
 // ============================================================
 exports.serveToken = async (req, res) => {
     try {
+        const queueId = req.params.id;
         const tokenId = req.params.tokenId;
 
         // Only staff/admin can serve students
@@ -356,7 +463,31 @@ exports.serveToken = async (req, res) => {
             });
         }
 
-        const token = await QueueToken.findById(tokenId);
+        // Check queue exists
+        const queue = await Queue.findById(queueId);
+
+        if (!queue) {
+            return res.status(404).json({
+                message: "Queue not found",
+            });
+        }
+
+        // Verify staff owns the queue.
+        // Admins can manage any queue.
+        if (
+            req.user.role !== "admin" &&
+            queue.managedBy.toString() !== req.user.id
+        ) {
+            return res.status(403).json({
+                message: "Not authorized to manage this queue",
+            });
+        }
+
+        // Make sure the token belongs to this queue
+        const token = await QueueToken.findOne({
+            _id: tokenId,
+            queue: queueId,
+        });
 
         if (!token) {
             return res.status(404).json({
@@ -375,6 +506,26 @@ exports.serveToken = async (req, res) => {
         token.servedAt = new Date();
 
         await token.save();
+
+        const io = req.app.get("io");
+
+        if (io) {
+            io.to(`queue-${queueId}`).emit("queueUpdated", {
+                queueId,
+                event: "tokenServed",
+                tokenId: token._id,
+                tokenNumber: token.tokenNumber,
+                status: token.status,
+            });
+
+            io.to(`user-${token.user}`).emit("queueUpdated", {
+                queueId,
+                event: "tokenServed",
+                tokenId: token._id,
+                tokenNumber: token.tokenNumber,
+                status: token.status,
+            });
+        }
 
         res.json({
             message: "Student served successfully",
@@ -397,6 +548,26 @@ exports.serveToken = async (req, res) => {
 exports.getQueueTokens = async (req, res) => {
     try {
         const queueId = req.params.id;
+
+        // Check queue exists
+        const queue = await Queue.findById(queueId);
+
+        if (!queue) {
+            return res.status(404).json({
+                message: "Queue not found",
+            });
+        }
+
+        // Staff can only view queues they manage.
+        // Admins can view any queue.
+        if (
+            req.user.role !== "admin" &&
+            queue.managedBy.toString() !== req.user.id
+        ) {
+            return res.status(403).json({
+                message: "Not authorized to view this queue",
+            });
+        }
 
         const tokens = await QueueToken.find({
             queue: queueId,
